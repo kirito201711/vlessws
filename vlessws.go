@@ -9,7 +9,7 @@ import (
 	"net"
 	"net/http"
 	"net/netip"
-	"strconv" // 新增引入，用于转换端口号
+	"strconv"
 	"sync"
 	"time"
 
@@ -41,17 +41,23 @@ func handleWS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 解析早期数据
+	// 1. 解析早期数据 (0-RTT)
+	// Xray 将早期数据 Base64 编码后放在 Sec-WebSocket-Protocol 头中
 	protocol := r.Header.Get("Sec-WebSocket-Protocol")
 	var earlyData []byte
+	var subprotocols []string // 用于回传给客户端
+
 	if protocol != "" {
 		if decoded, err := base64.RawURLEncoding.DecodeString(protocol); err == nil {
 			earlyData = decoded
+			// 【关键修复】必须将该 protocol 加入响应列表，否则客户端会认为握手失败
+			subprotocols = []string{protocol}
 		}
 	}
 
-	// nhooyr.io/websocket
+	// 2. 建立 WebSocket 连接
 	conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
+		Subprotocols:       subprotocols, // 【关键修复】传入子协议
 		CompressionMode:    websocket.CompressionDisabled,
 		InsecureSkipVerify: true,
 	})
@@ -65,9 +71,12 @@ func handleWS(w http.ResponseWriter, r *http.Request) {
 
 	ctx := context.Background()
 
+	// 3. 根据是否有 Early Data 决定处理逻辑
 	if earlyData != nil {
+		// 有 0-RTT 数据，直接处理，无需等待第一次 Read
 		handleConnection(ctx, conn, earlyData)
 	} else {
+		// 普通连接，读取第一包数据
 		_, msg, err := conn.Read(ctx)
 		if err != nil {
 			return
@@ -77,13 +86,12 @@ func handleWS(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleConnection(ctx context.Context, ws *websocket.Conn, data []byte) {
-	// 解析协议头
+	// VLESS 协议头部最小长度校验
 	if len(data) < 20 {
 		return
 	}
 
-	// 跳过 UUID (16字节) + 版本等信息，定位到目标地址部分
-	// VLESS 协议头部结构依赖这里，保持原逻辑不变
+	// 解析 VLESS 头部，跳过 UUID 等信息
 	i := 19 + int(data[17])
 	if i+3 > len(data) {
 		return
@@ -126,43 +134,41 @@ func handleConnection(ctx context.Context, ws *websocket.Conn, data []byte) {
 		return
 	}
 
-	// ---------------------------------------------------------
-	// 修复核心：使用 net.JoinHostPort 处理 IPv6 格式问题
-	// ---------------------------------------------------------
+	// 使用 net.JoinHostPort 自动处理 IPv6 的方括号问题
 	destAddr := net.JoinHostPort(addr, strconv.Itoa(int(port)))
 
-	// 连接目标
+	// 连接目标服务器
 	target, err := dialer.Dial("tcp", destAddr)
 	if err != nil {
-		// 可以在这里加日志查看连接失败原因
-		// fmt.Printf("Connect to %s failed: %v\n", destAddr, err)
 		return
 	}
 	defer target.Close()
 
-	// TCP 优化
+	// TCP 参数优化
 	if tc, ok := target.(*net.TCPConn); ok {
 		tc.SetNoDelay(true)
 		tc.SetKeepAlive(true)
 		tc.SetKeepAlivePeriod(30 * time.Second)
 	}
 
-	// 发送剩余数据 (Payload)
+	// 将剩余的 Payload (真实请求数据) 写入目标
+	// 对于 0-RTT，这里包含了客户端的第一条 HTTP 请求等数据
 	if i < len(data) {
 		if _, err := target.Write(data[i:]); err != nil {
 			return
 		}
 	}
 
-	// 发送响应 (VLESS 响应头)
+	// 向客户端发送 VLESS 响应头 (0, 0)
+	// 注意：对于 0-RTT，服务端在处理完 Early Data 后必须尽快返回这个响应
 	if err := ws.Write(ctx, websocket.MessageBinary, []byte{0, 0}); err != nil {
 		return
 	}
 
-	// 使用 NetConn 将 WebSocket 转为 net.Conn
+	// 将 WebSocket 封装为 net.Conn 以便进行 io.Copy
 	wsConn := websocket.NetConn(ctx, ws, websocket.MessageBinary)
 
-	// 双向 io.Copy
+	// 双向数据转发
 	var wg sync.WaitGroup
 	wg.Add(2)
 
@@ -170,14 +176,14 @@ func handleConnection(ctx context.Context, ws *websocket.Conn, data []byte) {
 	go func() {
 		defer wg.Done()
 		io.Copy(wsConn, target)
-		wsConn.Close()
+		wsConn.Close() // 目标关闭后，关闭 WS
 	}()
 
 	// websocket -> target
 	go func() {
 		defer wg.Done()
 		io.Copy(target, wsConn)
-		target.Close()
+		target.Close() // WS 关闭后，关闭目标连接
 	}()
 
 	wg.Wait()
