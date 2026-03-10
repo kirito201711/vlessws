@@ -12,8 +12,7 @@ import (
 	"strconv"
 	"sync"
 	"time"
-
-	"nhooyr.io/websocket"
+	"github.com/coder/websocket"
 )
 
 // 全局 Dialer
